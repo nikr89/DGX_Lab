@@ -1,0 +1,9 @@
+[Unit]
+Description=vLLM Token Tracker
+
+[Service]
+ExecStart=%h/bin/vllm_token_tracker.py collect
+Restart=always
+
+[Install]
+WantedBy=default.target
