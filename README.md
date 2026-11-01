@@ -42,7 +42,13 @@ benchmarks/   methodology, raw results (results.csv), run template
 notebooks/    Jupyter notebooks per chapter
 notes/        learning notes per chapter
 scripts/      reusable scripts (benchmarks, setup)
+vllm/         vLLM start scripts: production containers, standalone launchers, llama-swap config, benchmark matrix
+token-tracker/ token and GPU energy tracker for all vLLM servers on the box, with cloud cost comparison
 ```
+
+- [vllm/](vllm/) — all vLLM start scripts: production containers, standalone launchers, llama-swap config, benchmark matrix
+- [token-tracker/](token-tracker/) — counts tokens and GPU energy across all vLLM servers on the box and compares the cost with a cloud API
+- [results/2026-11_model-comparison.md](results/2026-11_model-comparison.md) — Qwen3.8-27B vs Ornith 1.5 122B vs Nemotron 3.5 Super VL 120B: test setup, results, recommendations, next tests
 
 ## Benchmarks
 
