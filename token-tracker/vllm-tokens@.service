@@ -1,0 +1,13 @@
+[Unit]
+Description=vLLM Token Tracker (%i)
+After=network.target docker.service
+
+[Service]
+User=%i
+ExecStart=/home/%i/bin/vllm_token_tracker.py collect
+Restart=always
+# vLLM-Modelle füllen beim Laden den gemeinsamen Speicher; der Tracker soll nicht das OOM-Opfer sein
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

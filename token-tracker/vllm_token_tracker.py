@@ -30,22 +30,34 @@ abrechnet.
   ./vllm_token_tracker.py price list                    # Preise und Zuordnung zu den Modellen
   ./vllm_token_tracker.py price rm qwen3-32b
 
-systemd (als User-Dienst, läuft dann ab Boot):
-  ~/.config/systemd/user/vllm-tokens.service
+Strom: nvidia-smi misst nur die GPU. Was der Rest der Maschine zusätzlich zieht (CPU, RAM, SSD,
+Netzteil), lässt sich als konstante Grundlast mit --overhead-watts oder VLLM_OVERHEAD_WATTS
+einrechnen, am besten einmal mit einer Messsteckdose ermitteln. Abstände über 60 s zwischen zwei
+Messwerten gelten als Messlücke (Collector oder Rechner aus) und zählen nicht zum Verbrauch.
+  ./vllm_token_tracker.py power --since 7d --overhead-watts 25
+
+systemd (als System-Dienst mit niedriger OOM-Priorität, damit er Speicherengpässe beim Laden
+großer Modelle übersteht; %i = Benutzername):
+  /etc/systemd/system/vllm-tokens@.service
     [Unit]
-    Description=vLLM Token Tracker
+    Description=vLLM Token Tracker (%i)
+    After=network.target docker.service
     [Service]
-    ExecStart=%h/bin/vllm_token_tracker.py collect
+    User=%i
+    ExecStart=/home/%i/bin/vllm_token_tracker.py collect
     Restart=always
+    OOMScoreAdjust=-500
     [Install]
-    WantedBy=default.target
-  systemctl --user enable --now vllm-tokens && sudo loginctl enable-linger $USER
+    WantedBy=multi-user.target
+  sudo systemctl enable --now vllm-tokens@$USER
 """
 import argparse
+import bisect
 import csv
 import functools
 import http.client
 import json
+import math
 import os
 import re
 import signal
@@ -59,6 +71,8 @@ from datetime import datetime
 from pathlib import Path
 
 DB_DEFAULT = os.environ.get("VLLM_TOKEN_DB", str(Path.home() / ".local/share/vllm-tokens/tokens.db"))
+OVERHEAD_DEFAULT = float(os.environ.get("VLLM_OVERHEAD_WATTS", "0"))
+MAX_GAP = 60  # Sekunden; größere Abstände zwischen Messwerten sind Lücken (Collector/Rechner aus)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -168,8 +182,7 @@ def sample_power():
         return None
 
 
-def energy_kwh(db, since=None, until=None):
-    """Energie in kWh im Zeitraum, per Trapez-Integration über die Watt-Samples."""
+def power_rows(db, since=None, until=None):
     where, params = [], []
     if since is not None:
         where.append("ts >= ?"); params.append(since)
@@ -178,9 +191,23 @@ def energy_kwh(db, since=None, until=None):
     sql = "SELECT ts, watts FROM power_samples"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    rows = db.execute(sql + " ORDER BY ts", params).fetchall()
-    wh = sum((w0 + w1) / 2 * (t1 - t0) / 3600 for (t0, w0), (t1, w1) in zip(rows, rows[1:]))
-    return wh / 1000
+    return db.execute(sql + " ORDER BY ts", params).fetchall()
+
+
+def integrate(rows, overhead_watts=0.0):
+    """(kWh, gemessene Stunden) per Trapez-Integration; Messlücken über MAX_GAP zählen nicht mit,
+    sonst würde z. B. ein ausgeschalteter Rechner als Mittelwert der Nachbarwerte weiterverbrauchen."""
+    wh = seconds = 0.0
+    for (t0, w0), (t1, w1) in zip(rows, rows[1:]):
+        if t1 - t0 <= MAX_GAP:
+            wh += ((w0 + w1) / 2 + overhead_watts) * (t1 - t0) / 3600
+            seconds += t1 - t0
+    return wh / 1000, seconds / 3600
+
+
+def energy_kwh(db, since=None, until=None, overhead_watts=0.0):
+    """Energie in kWh und gemessene Stunden im Zeitraum."""
+    return integrate(power_rows(db, since, until), overhead_watts)
 
 
 def discover(host, min_port):
@@ -213,9 +240,23 @@ def discover(host, min_port):
         return {e for e in pool.map(probe, sorted(p for p in ports if p >= min_port)) if e}
 
 
-def record(db, endpoint, model, cur, now, verbose):
+INSERT_SAMPLE = ("INSERT INTO samples (ts, session_id, prompt_tokens, generation_tokens, requests, cache_tokens) "
+                 "VALUES (?,?,?,?,?,?)")
+
+
+def spread(db, sid, delta, start, end):
+    """Nachgeholten Zuwachs gleichmäßig in Stundenschritten über [start, end] verteilen, damit er in
+    Tages-/Stundenreports nicht als Spitze auf dem Zeitpunkt des Nachholens landet."""
+    n = max(1, math.ceil((end - start) / 3600))
+    for i in range(n):
+        part = [d * (i + 1) // n - d * i // n for d in delta]  # Summe bleibt exakt delta
+        if any(part):
+            db.execute(INSERT_SAMPLE, (start + (end - start) * (i + 1) / n, sid, *part))
+
+
+def record(db, endpoint, model, cur, now, started, verbose):
     """Zählerstand einer Session zuordnen und den Zuwachs speichern."""
-    row = db.execute("SELECT id, server_start, raw_prompt, raw_gen, raw_req, raw_cache FROM sessions "
+    row = db.execute("SELECT id, server_start, raw_prompt, raw_gen, raw_req, raw_cache, last_seen FROM sessions "
                      "WHERE endpoint=? AND model=? ORDER BY id DESC LIMIT 1", (endpoint, model)).fetchone()
     same = False
     if row:
@@ -224,17 +265,23 @@ def record(db, endpoint, model, cur, now, verbose):
         else:                                              # Fallback: Zähler nie rückläufig
             same = cur["prompt"] >= row[2] and cur["gen"] >= row[3] and cur["req"] >= row[4]
     if same:
-        sid, base = row[0], row[2:]
+        sid, base, previous = row[0], row[2:6], row[6]
     else:
         # Neuer Server-Lauf. Zähler starten bei Prozessstart mit 0, daher zählt der volle
         # aktuelle Stand - auch Tokens von vor dem Start des Collectors gehen so nicht verloren.
         sid = db.execute("INSERT INTO sessions (endpoint, model, server_start, first_seen, last_seen) "
                          "VALUES (?,?,?,?,?)", (endpoint, model, cur["start"], now, now)).lastrowid
         base = (0, 0, 0, 0)
+        # lief der Server schon vor dem Collector, stammt der Stand aus der Zeit seit Serverstart
+        previous = cur["start"] if cur["start"] is not None and cur["start"] < started else now
         print(f"[{datetime.now():%F %T}] neue Session #{sid}: {model} @ {endpoint}", flush=True)
     delta = [max(0, round(cur[k] - b)) for k, b in zip(("prompt", "gen", "req", "cache"), base)]
-    if any(delta):
-        db.execute("INSERT INTO samples VALUES (?,?,?,?,?,?)", (now, sid, *delta))
+    if any(delta) and now - previous > MAX_GAP:
+        spread(db, sid, delta, previous, now)
+        print(f"  #{sid} {model}: Zuwachs seit {datetime.fromtimestamp(previous):%F %T} nachgeholt "
+              f"und über {(now - previous) / 3600:.1f} h verteilt", flush=True)
+    elif any(delta):
+        db.execute(INSERT_SAMPLE, (now, sid, *delta))
         if verbose:
             print(f"  #{sid} {model}: +{delta[1]} generiert, +{delta[0]} Prompt (davon {delta[3]} Cache), "
                   f"+{delta[2]} Requests", flush=True)
@@ -246,7 +293,10 @@ def cmd_collect(args):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     db = connect(args.db)
     fixed = {e.rstrip("/") for e in args.endpoint}
-    endpoints, next_scan = set(fixed), 0.0
+    endpoints, next_scan, started = set(fixed), 0.0, time.time()
+    if args.interval * 2 > MAX_GAP:
+        print(f"Warnung: --interval {args.interval:g} ist zu groß, Strom-Messwerte mit mehr als {MAX_GAP} s "
+              "Abstand gelten als Lücke und zählen nicht.", file=sys.stderr, flush=True)
     print(f"Collector läuft, DB: {args.db}", flush=True)
     try:
         while True:
@@ -254,13 +304,18 @@ def cmd_collect(args):
             if not args.no_scan and now >= next_scan:
                 endpoints = fixed | discover(args.host, args.min_port)
                 next_scan = now + args.rescan
+            seen = set()  # derselbe Server unter zwei Adressen (z. B. --endpoint plus Scan) nur einmal zählen
             for endpoint in sorted(endpoints):
                 try:
                     models = scrape(endpoint) or {}
                 except NET_ERRORS:
                     continue  # Server gestoppt; taucht beim nächsten Scan nicht mehr auf
                 for model, cur in models.items():
-                    record(db, endpoint, model, cur, now, args.verbose)
+                    if cur["start"] is not None:
+                        if (model, cur["start"]) in seen:
+                            continue
+                        seen.add((model, cur["start"]))
+                    record(db, endpoint, model, cur, now, started, args.verbose)
             if not args.no_power:
                 watts = sample_power()
                 if watts is not None:
@@ -352,6 +407,8 @@ def emit(rows, fmt, totals=True):
     swap = str.maketrans(",.", ".,")  # deutsche Schreibweise: 1.234,5678
 
     def cell(value):
+        if value is None:
+            return "-"
         if isinstance(value, float):
             return f"{value:,.4f}".translate(swap)
         return f"{value:,}".translate(swap) if isinstance(value, int) else str(value)
@@ -405,30 +462,38 @@ def cmd_sessions(args):
     sql = (f"SELECT CAST(x.id AS TEXT) AS session, x.endpoint, x.model, "
            f"{stamp.format('COALESCE(x.server_start, x.first_seen)')} AS start, "
            f"{stamp.format('x.last_seen')} AS zuletzt_gesehen, "
+           f"COALESCE(x.server_start, x.first_seen) AS t0, x.last_seen AS t1, "
            + ", ".join([f"COALESCE(SUM(s.{c}), 0) AS {c}" for c in SUMS] + (COST_SQL if priced else []))
            + " FROM sessions x LEFT JOIN samples s ON s.session_id = x.id GROUP BY x.id ORDER BY x.id")
-    emit(run_query(db, sql, (), lookup, priced), args.format, totals=False)
+    rows = run_query(db, sql, (), lookup, priced)
+    # Strom im Zeitfenster jeder Session. Laufen Sessions parallel (z. B. Embedding neben LLM),
+    # bekommt jede den vollen Verbrauch der GPU in ihrem Fenster.
+    power = power_rows(db)
+    stamps = [t for t, _ in power]
+    for row in rows:
+        t0, t1 = row.pop("t0"), row.pop("t1")
+        kwh, hours = integrate(power[bisect.bisect_left(stamps, t0):bisect.bisect_right(stamps, t1)],
+                               args.overhead_watts)
+        row["kwh"] = round(kwh, 3)
+        row["strom_abdeckung_pct"] = round(hours * 3600 / (t1 - t0) * 100) if t1 > t0 else None
+        row["wh_pro_mio_output"] = (round(kwh * 1e9 / row["generation_tokens"], 1)
+                                    if row["generation_tokens"] and hours else None)
+    emit(rows, args.format, totals=False)
 
 
 def cmd_power(args):
     db = connect(args.db)
-    since, until = parse_time(args.since), parse_time(args.until)
-    where, params = [], []
-    if since is not None:
-        where.append("ts >= ?"); params.append(since)
-    if until is not None:
-        where.append("ts < ?"); params.append(until)
-    sql = "SELECT MIN(ts), MAX(ts), AVG(watts), COUNT(*) FROM power_samples"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    first, last, avg_watts, n = db.execute(sql, params).fetchone()
-    if not n:
+    rows = power_rows(db, parse_time(args.since), parse_time(args.until))
+    kwh, hours = integrate(rows, args.overhead_watts)
+    if not hours:
         print("Keine Strom-Messwerte für diese Filter (Collector läuft noch nicht lange genug "
               "oder --no-power war gesetzt).", file=sys.stderr)
         return
-    kwh = energy_kwh(db, since, until)
-    row = {"zeitraum_h": round((last - first) / 3600, 2), "avg_watt": round(avg_watts, 1),
-           "kwh": round(kwh, 4), "kosten_euro": round(kwh * args.price, 4)}
+    row = {"zeitraum_h": round((rows[-1][0] - rows[0][0]) / 3600, 2), "gemessen_h": round(hours, 2),
+           "avg_watt": round(kwh * 1000 / hours, 1), "kwh": round(kwh, 4)}
+    if args.overhead_watts:
+        row["davon_grundlast_kwh"] = round(args.overhead_watts * hours / 1000, 4)
+    row["kosten_euro"] = round(kwh * args.price, 4)
     emit([row], args.format, totals=False)
 
 
@@ -449,17 +514,22 @@ def cmd_roi(args):
     if where:
         sql += " WHERE " + " AND ".join(where)
     totals = run_query(db, sql, params, lookup, priced)[0]
-    ersparnis = totals["kosten_gesamt"]
+    ersparnis = totals["kosten_gesamt"] * args.fx
 
-    kwh = energy_kwh(db, since, until)
+    kwh, _ = energy_kwh(db, since, until, args.overhead_watts)
     stromkosten = kwh * args.kwh_price
     zeitkosten = args.hours * args.hourly_rate
     investition = args.hardware_cost + zeitkosten + stromkosten
     netto = ersparnis - investition
 
+    # Raten über denselben Zeitraum wie Ersparnis und Strom, nicht pauschal ab der ersten Session
     first_seen = db.execute("SELECT MIN(first_seen) FROM sessions").fetchone()[0]
-    tage = max((time.time() - first_seen) / 86400, 0.001) if first_seen else 0
+    start = max(since, first_seen) if since is not None and first_seen else (since or first_seen)
+    end = min(until, time.time()) if until is not None else time.time()
+    tage = max((end - start) / 86400, 0.001) if start else 0
     rate_pro_tag = ersparnis / tage if tage else 0
+    strom_pro_tag = stromkosten / tage if tage else 0
+    netto_pro_tag = rate_pro_tag - strom_pro_tag  # Strom läuft auch künftig weiter
     rest = investition - ersparnis
 
     row = {
@@ -472,15 +542,17 @@ def cmd_roi(args):
         "investition_gesamt": round(investition, 2),
         "netto_bisher": round(netto, 2),
         "ersparnis_pro_tag": round(rate_pro_tag, 2),
+        "strom_pro_tag": round(strom_pro_tag, 2),
+        "netto_pro_tag": round(netto_pro_tag, 2),
     }
-    if rest > 0 and rate_pro_tag > 0:
-        breakeven_tage = rest / rate_pro_tag
+    if rest > 0 and netto_pro_tag > 0:
+        breakeven_tage = rest / netto_pro_tag
         row["noch_bis_breakeven_tage"] = round(breakeven_tage, 1)
         row["breakeven_ca"] = datetime.fromtimestamp(time.time() + breakeven_tage * 86400).strftime("%Y-%m-%d")
     elif rest <= 0:
         row["status"] = "break-even bereits erreicht"
     else:
-        row["status"] = "noch keine Ersparnis > 0, Prognose nicht möglich"
+        row["status"] = "Ersparnis deckt den Strom nicht, Prognose nicht möglich"
     emit([row], args.format, totals=False)
 
 
@@ -540,14 +612,20 @@ def main():
     r.add_argument("--format", choices=("table", "csv", "json"), default="table")
     r.set_defaults(func=cmd_report)
 
-    s = sub.add_parser("sessions", help="alle Server-Läufe auflisten")
+    overhead = dict(type=float, default=OVERHEAD_DEFAULT,
+                    help="Grundlast der restlichen Maschine in Watt, die nvidia-smi nicht sieht "
+                         f"(Standard: VLLM_OVERHEAD_WATTS bzw. {OVERHEAD_DEFAULT:g})")
+
+    s = sub.add_parser("sessions", help="alle Server-Läufe auflisten, mit Strom und Wh pro 1 Mio. Output-Tokens")
+    s.add_argument("--overhead-watts", **overhead)
     s.add_argument("--format", choices=("table", "csv", "json"), default="table")
     s.set_defaults(func=cmd_sessions)
 
-    pw = sub.add_parser("power", help="GPU-Stromverbrauch auswerten (nvidia-smi-Sampling aus 'collect')")
+    pw = sub.add_parser("power", help="Stromverbrauch auswerten (nvidia-smi-Sampling aus 'collect')")
     pw.add_argument("--since", help="ab wann: 24h, 7d, today oder 2026-10-01[T08:00]")
     pw.add_argument("--until", help="bis wann (exklusiv), gleiche Formate")
     pw.add_argument("--price", type=float, default=0.34, help="Preis pro kWh in Euro (Standard: 0.34)")
+    pw.add_argument("--overhead-watts", **overhead)
     pw.add_argument("--format", choices=("table", "csv", "json"), default="table")
     pw.set_defaults(func=cmd_power)
 
@@ -559,6 +637,9 @@ def main():
                      help="Anschaffungskosten der Hardware in Euro (Standard: 3850)")
     roi.add_argument("--years", type=float, default=3.0, help="Abschreibungszeitraum in Jahren (Standard: 3)")
     roi.add_argument("--kwh-price", type=float, default=0.34, help="Strompreis pro kWh in Euro (Standard: 0.34)")
+    roi.add_argument("--overhead-watts", **overhead)
+    roi.add_argument("--fx", type=float, default=1.0,
+                     help="Kurs der Vergleichspreise in Euro, z. B. 0.92 bei Preisen in USD (Standard: 1)")
     roi.add_argument("--since", help="ab wann Ersparnis/Strom zählen (Standard: seit der ersten Session)")
     roi.add_argument("--until", help="bis wann (exklusiv)")
     roi.add_argument("--format", choices=("table", "csv", "json"), default="table")
