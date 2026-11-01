@@ -2,7 +2,10 @@
 .env
 .env.*
 *.key
-*token*
+*.token
+*_token
+*_token.txt
+hf_token*
 secrets/
 
 # Python
