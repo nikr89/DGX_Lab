@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+*.key
+*token*
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Models and large artifacts
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.engine
+*.onnx
+models/
+checkpoints/
+outputs/
+hf_cache/
+
+# System
+.DS_Store
